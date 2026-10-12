@@ -69,8 +69,10 @@ PS VR2 compositor, at 120 Hz.
 
 ## Install
 
-You need a jailbroken PS5 with an ELF loader (tested on 13.60 with Relapse,
-kstuff, ShadowMount+ and etaHEN) and a PS VR2.
+You need a jailbroken PS5 with an ELF loader and a PS VR2.
+
+**Tested firmware: 7.20 and 13.60.** Experimental hand tracking is not supported on 7.20.
+See [firmware support](docs/firmware-support.md) for details.
 
 1. Copy the `PPSA99177` folder from the release to `/data/homebrew/` on the
    console. ShadowMount+ installs it as a "PS5VR" tile.
@@ -120,7 +122,8 @@ LLPC for gfx1013; their generators are in `app/tools/shaders/`.
 ## How it works
 
 - The PS VR2 system libraries (libSceHmd2, libSceVrTracker2, libSceVrHand)
-  are loaded at runtime and called by their exports on firmware 13.60. The
+  are loaded at runtime and called by their exports. Headset and tracker tables
+  are included for 13.60 and 7.20; the hand library table is for 13.60. The
   picture goes to the headset as a type 0x10 layer through Hmd2's
   reprojection, the way PS VR2 games submit it.
 - Each decoded frame is converted once on the GPU and projected per eye
@@ -131,7 +134,7 @@ LLPC for gfx1013; their generators are in `app/tools/shaders/`.
 Other firmware versions need their own export table, and it has to be
 generated from that firmware's own libraries: a 13.60 console cannot produce a
 12.40 table. If you are on another firmware and want it supported, see
-[docs/firmware-support.md](docs/firmware-support.md) for the three libraries
+[docs/firmware-support.md](docs/firmware-support.md) for the libraries
 needed and how to generate the table. Wrong-firmware tables fail safely: each
 one carries an anchor string that is checked before any offset is used.
 

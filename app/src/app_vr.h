@@ -61,6 +61,8 @@ uint64_t app_vr_frame_time(void);
 void app_vr_camera_probe(void);
 /* Where libSceVrTracker2 is loaded (0 before app_vr_preload). */
 uintptr_t app_vr_tracker_base(void);
+/* Bases for the known 13.60 hand-model import patch; 0 on other builds. */
+int app_vr_hand_model_bases(uintptr_t *hand, uintptr_t *tracker);
 /* The head position in tracker space (metres) and the rotation from tracker
  * space to the space the picture and panels are drawn in. */
 void app_vr_head_pose(float pos[3], float yaw_q[4]);

@@ -169,8 +169,11 @@ static void patch_model_import(void)
 {
     if (s_models_patched || !sceVrHandInitialize)
         return;
-    const uintptr_t hand = (uintptr_t)sceVrHandInitialize - 0x197c0;
-    const uintptr_t tracker = app_vr_tracker_base();
+    uintptr_t hand, tracker;
+    if (!app_vr_hand_model_bases(&hand, &tracker)) {
+        eng_bt("vr: hand model import patch unavailable for this firmware");
+        return;
+    }
     uint64_t *slot = (uint64_t *)(hand + VRHAND_GOT_MODEL);
     if (!tracker || *slot != tracker + VRTRACKER2_MODEL_FN) {
         eng_bt("vr: hand model import not as expected (%p), left alone", (void *)*slot);

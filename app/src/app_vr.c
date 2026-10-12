@@ -3,8 +3,8 @@
  *
  * Hmd2 and VrTracker2 are system modules: they are loaded with
  * sceSysmoduleLoadModule and their functions found through sceKernelDlsym, or,
- * where an app may not dlsym them, at the FW 13.60 export offsets after a
- * module-name and rodata check (vr_exports_1360.h). The frame setup is the one
+ * where an app may not dlsym them, at firmware-specific export offsets after
+ * a module-name and rodata check (vr_exports_*.h). The frame setup is the one
  * Horizon Call of the Mountain uses (ps5vr/research/hmd2-notes.md): a type 0x10
  * layer whose two textures are the same side-by-side eye buffer, with per-eye
  * viewports, FOV tangents, the device pose and the predicted display time.
@@ -48,7 +48,9 @@ typedef struct { uint64_t size, align; } SizeAlign;
     X(int, sceHmd2ReprojectionDisableMirroring, (void))                                    \
     X(int, sceHmd2ReprojectionTerminate, (void))                                           \
     X(int, sceHmd2Close, (int handle))                                                     \
-    X(int, sceHmd2Terminate, (void))                                                       \
+    X(int, sceHmd2Terminate, (void))
+/* Camera diagnostics, gaze and rumble may be absent on older firmware. */
+#define HMD2_OPTIONAL_FUNCS(X)                                                              \
     X(int, sceHmd2InternalImageOpenBySlot, (int slot))                                     \
     X(int, sceHmd2InternalLedDetectorOpenBySlot, (int slot))                               \
     X(int, sceHmd2GazeGetResult, (const void *param, void *result))                        \
@@ -64,6 +66,7 @@ typedef struct { uint64_t size, align; } SizeAlign;
     X(int, sceVrTracker2Finalize, (void))
 #define DECLARE_PTR(ret, name, args) static ret(*name) args;
 HMD2_FUNCS(DECLARE_PTR)
+HMD2_OPTIONAL_FUNCS(DECLARE_PTR)
 VRTRACKER2_FUNCS(DECLARE_PTR)
 
 #define SYSMODULE_HMD2       0x12a
@@ -121,12 +124,34 @@ int sceVideoOutConfigureOutput(int handle, uint64_t mode, const void *options, c
 typedef struct { const char *name; uint32_t offset; } export_sig_t;
 typedef struct { uint32_t va; const char *text; } export_anchor_t;
 #include "vr_exports_1360.h"
+#include "vr_exports_720.h"
 
-typedef struct { const char *name; void **slot; } slot_t;
-#define SLOT(ret, name, args) {#name, (void **)&name},
-static slot_t kHmd2Slots[] = {HMD2_FUNCS(SLOT)};
+typedef struct { const char *name; void **slot; int optional; } slot_t;
+#define SLOT(ret, name, args) {#name, (void **)&name, 0},
+#define OPTIONAL_SLOT(ret, name, args) {#name, (void **)&name, 1},
+static slot_t kHmd2Slots[] = {HMD2_FUNCS(SLOT) HMD2_OPTIONAL_FUNCS(OPTIONAL_SLOT)};
 static slot_t kVrTracker2Slots[] = {VRTRACKER2_FUNCS(SLOT)};
 #define COUNT(a) (sizeof(a) / sizeof *(a))
+
+typedef struct {
+    const char *file, *firmware;
+    const export_sig_t *exports;
+    size_t count;
+    const export_anchor_t *anchor;
+} export_profile_t;
+#define PROFILE(lib, fw, suffix) \
+    {#lib ".sprx", fw, k##lib##Exports##suffix, COUNT(k##lib##Exports##suffix), \
+     &k##lib##Anchor##suffix}
+static const export_profile_t kExportProfiles[] = {
+    PROFILE(libSceHmd2, "13.60", ),
+    PROFILE(libSceHmd2, "7.20", 720),
+    PROFILE(libSceVrTracker2, "13.60", ),
+    PROFILE(libSceVrTracker2, "7.20", 720),
+    PROFILE(libSceVrHand, "13.60", ),
+    PROFILE(libSceSystemService, "13.60", ),
+};
+typedef struct { uintptr_t base; const export_profile_t *profile; } resolved_module_t;
+static resolved_module_t s_tracker_module, s_hand_module;
 
 typedef struct {
     uint64_t size;
@@ -159,39 +184,60 @@ static uintptr_t module_base(int h, const char *file, const export_anchor_t *anc
     for (unsigned i = 0; i < mi.nseg && i < 4; i++)
         if (!base || mi.seg[i].addr < base)
             base = mi.seg[i].addr;
+    if (!base || !anchor)
+        return base;
+    if (anchor->va > UINTPTR_MAX - base)
+        return 0;
     const uintptr_t want = base + anchor->va;
     const size_t len = strlen(anchor->text) + 1;
     for (unsigned i = 0; i < mi.nseg && i < 4; i++) {
-        const uintptr_t lo = mi.seg[i].addr, hi = lo + mi.seg[i].size;
-        if (want >= lo && want + len <= hi && (mi.seg[i].prot & 1))
+        const uintptr_t lo = mi.seg[i].addr;
+        const size_t size = mi.seg[i].size;
+        if (want >= lo && want - lo <= size && len <= size - (want - lo) && (mi.seg[i].prot & 1))
             return memcmp((const void *)want, anchor->text, len) == 0 ? base : 0;
     }
     return 0;
 }
 
 static int resolve_module(int h, const char *file, slot_t *slots, size_t n,
-                          const export_sig_t *table, size_t table_n,
-                          const export_anchor_t *anchor)
+                          resolved_module_t *loaded)
 {
-    uintptr_t base = 0;
-    int tried_base = 0, ok = 1;
-    for (size_t i = 0; i < n; i++) {
-        if (sceKernelDlsym(h, slots[i].name, slots[i].slot) == 0 && *slots[i].slot)
-            continue;
-        if (!tried_base) {
-            base = module_base(h, file, anchor);
-            tried_base = 1;
-            eng_bt("vr: %s by export offsets, base %p", file, (void *)base);
-        }
-        *slots[i].slot = NULL;
-        for (size_t j = 0; base && j < table_n; j++)
-            if (!strcmp(table[j].name, slots[i].name))
-                *slots[i].slot = (void *)(base + table[j].offset);
-        if (!*slots[i].slot) {
-            eng_bt("vr: missing %s", slots[i].name);
-            ok = 0;
+    resolved_module_t module = {0};
+    for (size_t i = 0; i < COUNT(kExportProfiles); i++) {
+        const export_profile_t *p = &kExportProfiles[i];
+        if (!strcmp(p->file, file) && (module.base = module_base(h, file, p->anchor))) {
+            module.profile = p;
+            break;
         }
     }
+    if (module.profile)
+        eng_bt("vr: %s matched FW %s, base %p", file, module.profile->firmware, (void *)module.base);
+    else {
+        module.base = module_base(h, file, NULL);
+        eng_bt("vr: %s has no matching export table; trying dlsym", file);
+    }
+    int ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        *slots[i].slot = NULL;
+        if (sceKernelDlsym(h, slots[i].name, slots[i].slot) == 0 && *slots[i].slot)
+            continue;
+        *slots[i].slot = NULL;
+        const export_profile_t *p = module.profile;
+        for (size_t j = 0; p && j < p->count; j++)
+            if (!strcmp(p->exports[j].name, slots[i].name))
+                *slots[i].slot = (void *)(module.base + p->exports[j].offset);
+        if (!*slots[i].slot) {
+            eng_bt("vr: missing %s%s", slots[i].name, slots[i].optional ? " (optional)" : "");
+            if (!slots[i].optional)
+                ok = 0;
+        }
+    }
+    /* Do not leave a partially bound module available to callers on failure. */
+    if (!ok)
+        for (size_t i = 0; i < n; i++)
+            *slots[i].slot = NULL;
+    if (loaded)
+        *loaded = ok ? module : (resolved_module_t){0};
     return ok ? 0 : -1;
 }
 
@@ -436,15 +482,22 @@ void app_vr_vibrate(int strength)
         sceHmd2SetVibration(g.hmd, strength < 0 ? 0 : strength > 25 ? 25 : strength);
 }
 
-/* Load address of libSceVrTracker2 (from a bound export), 0 if not bound. */
+/* Use the loader's address, not an export offset from a different firmware. */
 uintptr_t app_vr_tracker_base(void)
 {
-    if (!sceVrTracker2GetResult)
+    return s_tracker_module.base;
+}
+
+/* The hand-model import patch is only known for these two 13.60 builds. */
+int app_vr_hand_model_bases(uintptr_t *hand, uintptr_t *tracker)
+{
+    if (!s_hand_module.profile || !s_tracker_module.profile ||
+        s_hand_module.profile->exports != klibSceVrHandExports ||
+        s_tracker_module.profile->exports != klibSceVrTracker2Exports)
         return 0;
-    for (size_t i = 0; i < COUNT(klibSceVrTracker2Exports); i++)
-        if (!strcmp(klibSceVrTracker2Exports[i].name, "sceVrTracker2GetResult"))
-            return (uintptr_t)sceVrTracker2GetResult - klibSceVrTracker2Exports[i].offset;
-    return 0;
+    *hand = s_hand_module.base;
+    *tracker = s_tracker_module.base;
+    return 1;
 }
 
 /* Hand tracking's camera opens, as libSceVrHand makes them (both are
@@ -530,18 +583,12 @@ int app_vr_worn(void)
  * sandbox's common/lib and bound by this firmware's export offsets. */
 int app_vr_bind(const char *lib, const char *const *names, void **slots, int n)
 {
-    static const struct {
-        const char *lib;
-        const export_sig_t *table;
-        size_t count;
-        const export_anchor_t *anchor;
-    } kLibs[] = {
-        {"libSceVrHand", klibSceVrHandExports, COUNT(klibSceVrHandExports), &klibSceVrHandAnchor},
-        {"libSceSystemService", klibSceSystemServiceExports, COUNT(klibSceSystemServiceExports),
-         &klibSceSystemServiceAnchor},
-    };
+    static const char *const kLibs[] = {"libSceVrHand", "libSceSystemService"};
+    if (n <= 0 || n > 16)
+        return -1;
+    memset(slots, 0, (size_t)n * sizeof *slots);
     for (size_t k = 0; k < COUNT(kLibs); k++) {
-        if (strcmp(kLibs[k].lib, lib))
+        if (strcmp(kLibs[k], lib))
             continue;
         char path[128], file[64];
         snprintf(path, sizeof path, "/%s/common/lib/%s.sprx", sceKernelGetFsSandboxRandomWord(), lib);
@@ -552,13 +599,13 @@ int app_vr_bind(const char *lib, const char *const *names, void **slots, int n)
         if (h < 0)
             return -1;
         slot_t sl[16];
-        if (n > 16)
-            return -1;
         for (int i = 0; i < n; i++) {
             sl[i].name = names[i];
             sl[i].slot = &slots[i];
+            sl[i].optional = 0;
         }
-        return resolve_module(h, file, sl, (size_t)n, kLibs[k].table, kLibs[k].count, kLibs[k].anchor);
+        return resolve_module(h, file, sl, (size_t)n,
+                              !strcmp(lib, "libSceVrHand") ? &s_hand_module : NULL);
     }
     return -1;
 }
@@ -573,12 +620,11 @@ int app_vr_preload(void)
     done = -1;
     int h = load_sysmodule(SYSMODULE_HMD2, "libSceHmd2");
     if (h < 0 || resolve_module(h, "libSceHmd2.sprx", kHmd2Slots, COUNT(kHmd2Slots),
-                                klibSceHmd2Exports, COUNT(klibSceHmd2Exports), &klibSceHmd2Anchor))
+                                NULL))
         return -1;
     h = load_sysmodule(SYSMODULE_VRTRACKER2, "libSceVrTracker2");
     if (h < 0 || resolve_module(h, "libSceVrTracker2.sprx", kVrTracker2Slots,
-                                COUNT(kVrTracker2Slots), klibSceVrTracker2Exports,
-                                COUNT(klibSceVrTracker2Exports), &klibSceVrTracker2Anchor))
+                                COUNT(kVrTracker2Slots), &s_tracker_module))
         return -1;
     done = 1;
     vr_system_preload();
@@ -973,6 +1019,7 @@ void app_vr_head_dir(float *y, float *p) { if (y) *y = 0; if (p) *p = 0; }
 uint64_t app_vr_frame_time(void) { return 0; }
 void app_vr_camera_probe(void) {}
 uintptr_t app_vr_tracker_base(void) { return 0; }
+int app_vr_hand_model_bases(uintptr_t *hand, uintptr_t *tracker) { return 0; }
 int app_vr_gaze(void *result) { (void)result; return -1; }
 void app_vr_to_view(const float p[3], float out[3]) { out[0] = p[0]; out[1] = p[1]; out[2] = p[2]; }
 void app_vr_vibrate(int strength) { (void)strength; }
